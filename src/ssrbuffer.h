@@ -26,8 +26,14 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#if defined(_MSC_VER)
+//#define __MEM_CHECK__ 1
+#endif
+
 #if __MEM_CHECK__
+#if !defined(_CRTDBG_MAP_ALLOC)
 #define _CRTDBG_MAP_ALLOC
+#endif
 #include <stdlib.h>
 #include <crtdbg.h>
 
@@ -38,10 +44,12 @@
 #else
 
 #define MEM_CHECK_BEGIN() do { ; } while(0)
-#define MEM_CHECK_BREAK_ALLOC(x) do { x; } while(0)
+#define MEM_CHECK_BREAK_ALLOC(x) do { (void)x; } while(0)
 #define MEM_CHECK_DUMP_LEAKS() do { ; } while(0)
 
 #endif // __MEM_CHECK__
+
+struct buffer_t;
 
 struct buffer_t {
     size_t len;
@@ -54,6 +62,7 @@ struct buffer_t * buffer_create(size_t capacity);
 struct buffer_t * buffer_create_from(const uint8_t *data, size_t len);
 size_t buffer_get_length(const struct buffer_t *ptr);
 const uint8_t * buffer_get_data(const struct buffer_t *ptr, size_t *length);
+size_t buffer_get_capacity(const struct buffer_t *ptr);
 void buffer_add_ref(struct buffer_t *ptr);
 void buffer_release(struct buffer_t *ptr);
 int buffer_compare(const struct buffer_t *ptr1, const struct buffer_t *ptr2, size_t size);
@@ -67,5 +76,7 @@ void buffer_replace(struct buffer_t *dst, const struct buffer_t *src);
 size_t buffer_concatenate(struct buffer_t *ptr, const uint8_t *data, size_t size);
 size_t buffer_concatenate2(struct buffer_t *dst, const struct buffer_t *src);
 void buffer_shortened_to(struct buffer_t *ptr, size_t begin, size_t len);
+
+uint8_t * mem_insert(const uint8_t *src, size_t src_size, size_t pos, const uint8_t *chunk, size_t chunk_size, void*(*allocator)(size_t), size_t *total_size);
 
 #endif // __SSR_BUFFER_H__

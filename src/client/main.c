@@ -42,6 +42,10 @@ struct ssr_client_state *g_state = NULL;
 void feedback_state(struct ssr_client_state *state, void *p);
 void print_remote_info(const struct server_config *config);
 
+void fn_onexit(void) {
+    MEM_CHECK_DUMP_LEAKS();
+}
+
 int main(int argc, char **argv) {
     struct server_config *config = NULL;
     int err = -1;
@@ -50,6 +54,8 @@ int main(int argc, char **argv) {
     MEM_CHECK_BEGIN();
     MEM_CHECK_BREAK_ALLOC(63);
     MEM_CHECK_BREAK_ALLOC(64);
+
+    atexit(fn_onexit);
 
     do {
         set_app_name(argv[0]);
@@ -71,6 +77,8 @@ int main(int argc, char **argv) {
         if (parse_config_file(false, cmds->cfg_file, config) == false) {
             break;
         }
+
+        config_ssrot_revision(config);
 
 #ifndef UDP_RELAY_ENABLE
         config->udp = false;
@@ -103,8 +111,6 @@ int main(int argc, char **argv) {
     if (err != 0) {
         usage();
     }
-
-    MEM_CHECK_DUMP_LEAKS();
 
     return 0;
 }

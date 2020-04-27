@@ -160,6 +160,7 @@ void do_dealloc_uv_buffer(uv_buf_t *buf) {
 }
 
 static void on_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
+    (void)handle;
     do_alloc_uv_buffer(suggested_size, buf);
 }
 
@@ -187,7 +188,7 @@ static int uv_stream_fd(const uv_tcp_t *handle) {
 }
 
 static uint16_t get_socket_port(const uv_tcp_t *tcp) {
-    union sockaddr_universal tmp = { 0 };
+    union sockaddr_universal tmp = { {0} };
     int len = sizeof(tmp);
     if (uv_tcp_getsockname(tcp, &tmp.addr, &len) != 0) {
         return 0;
@@ -242,7 +243,7 @@ create_and_bind(const char *addr, unsigned short port, uv_loop_t *loop, uv_tcp_t
     }
 
     if (rp == NULL) {
-        LOGE("Could not bind");
+        LOGE("%s", "Could not bind");
         return -1;
     }
 
@@ -293,16 +294,23 @@ int _tunnel_encrypt(struct local_t *local, struct buffer_t *buf) {
     struct obfs_t *protocol_plugin;
     int err;
     struct obfs_t *obfs_plugin;
+    size_t capacity = buffer_get_capacity(buf);
 
-    assert(buf->capacity >= SSR_BUFF_SIZE);
+    assert(capacity >= SSR_BUFF_SIZE);
 
     env = local->server_env;
     // SSR beg
     protocol_plugin = local->protocol;
 
     if (protocol_plugin && protocol_plugin->client_pre_encrypt) {
-        buf->len = (size_t)protocol_plugin->client_pre_encrypt(
-            local->protocol, (char **)&buf->buffer, (int)buf->len, &buf->capacity);
+        size_t buf_len = 0;
+        const uint8_t *pbb = buffer_get_data(buf, &buf_len);
+        uint8_t *buf_buffer = (uint8_t *) calloc(capacity, sizeof(*buf_buffer));
+        memmove(buf_buffer, pbb, buf_len);
+        buf_len = (size_t)protocol_plugin->client_pre_encrypt(
+            local->protocol, (char **)&buf_buffer, (int)buf_len, &capacity);
+        buffer_store(buf, buf_buffer, buf_len);
+        free(buf_buffer);
     }
     err = ss_encrypt(env->cipher, buf, local->e_ctx, SSR_BUFF_SIZE);
     if (err != 0) {
@@ -324,7 +332,7 @@ int _tunnel_decrypt(struct local_t *local, struct buffer_t *buf, struct buffer_t
     struct obfs_t *obfs_plugin;
     struct obfs_t *protocol_plugin;
 
-    assert(buf->len <= SSR_BUFF_SIZE);
+    assert(buffer_get_length(buf) <= SSR_BUFF_SIZE);
 
     env = local->server_env;
 
@@ -345,7 +353,7 @@ int _tunnel_decrypt(struct local_t *local, struct buffer_t *buf, struct buffer_t
             buffer_release(empty);
         }
     }
-    if (buf->len > 0) {
+    if (buffer_get_length(buf) > 0) {
         int err = ss_decrypt(env->cipher, buf, local->d_ctx, SSR_BUFF_SIZE);
         if (err != 0) {
             return -1;
@@ -353,12 +361,20 @@ int _tunnel_decrypt(struct local_t *local, struct buffer_t *buf, struct buffer_t
     }
     protocol_plugin = local->protocol;
     if (protocol_plugin && protocol_plugin->client_post_decrypt) {
-        ssize_t len = (size_t)protocol_plugin->client_post_decrypt(
-            local->protocol, (char **)&buf->buffer, (int)buf->len, &buf->capacity);
+        ssize_t len;
+        size_t capacity = buffer_get_capacity(buf);
+        size_t buf_len = 0;
+        const uint8_t *pbb = buffer_get_data(buf, &buf_len);
+        uint8_t *buf_buffer = (uint8_t *) calloc(capacity, sizeof(*buf_buffer));
+        memcpy(buf_buffer, pbb, buf_len);
+        len = (size_t)protocol_plugin->client_post_decrypt(
+            local->protocol, (char **)&buf_buffer, (int)buf_len, &capacity);
         if (len < 0) {
+            free(buf_buffer);
             return -1;
         }
-        buf->len = (size_t)len;
+        buffer_store(buf, buf_buffer, (size_t)len);
+        free(buf_buffer);
     }
     // SSR end
     return 0;
@@ -385,8 +401,7 @@ local_recv_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf0)
 
     if (nread > 0) {
         buffer_realloc(buf, (size_t)nread * 2);
-        memcpy(buf->buffer, buf0->base, (size_t)nread);
-        buf->len = (size_t)nread;
+        buffer_store(buf, (const uint8_t*)buf0->base, (size_t)nread);
     }
 
     do_dealloc_uv_buffer((uv_buf_t *)buf0);
@@ -405,16 +420,14 @@ local_recv_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf0)
         char *host = local->listener->tunnel_addr.host;
         char *port = local->listener->tunnel_addr.port;
         if (host && port) {
-            struct buffer_t *buffer = buffer_create(SSR_BUFF_SIZE);
+            uint8_t *buffer = (uint8_t *) calloc(SSR_BUFF_SIZE, sizeof(*buffer));
             size_t header_len = 0;
             struct socks5_request *hdr =
-                    build_socks5_request(host, (uint16_t)atoi(port), buffer->buffer, buffer->capacity, &header_len);
+                    build_socks5_request(host, (uint16_t)atoi(port), buffer, SSR_BUFF_SIZE, &header_len);
 
-            memmove(buf->buffer + header_len, buf->buffer, buf->len);
-            memmove(buf->buffer, hdr, header_len);
-            buf->len += header_len;
+            buffer_insert(buf, 0, (uint8_t*)hdr, header_len);
 
-            buffer_release(buffer);
+            free(buffer);
 
             local->stage = STAGE_PARSE;
         }
@@ -429,7 +442,7 @@ local_recv_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf0)
             // insert shadowsocks header
             r = _tunnel_encrypt(local, remote->buf);
             if (r < 0) {
-                LOGE("local invalid password or cipher");
+                LOGE("%s", "local invalid password or cipher");
                 tunnel_close_and_free(remote, local);
                 return;
             }
@@ -468,7 +481,7 @@ local_recv_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf0)
                 uv_tcp_connect(connect, &remote->socket, addr, remote_connected_cb);
                 return;
             } else {
-                if (remote->buf->len == 0) {
+                if (buffer_get_length(remote->buf) == 0) {
                     local_read_stop(local);
                     return;
                 }
@@ -481,17 +494,17 @@ local_recv_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf0)
             int off;
             struct method_select_request *request = (struct method_select_request *)buf->buffer;
 
-            struct buffer_t *buffer = buffer_create(SSR_BUFF_SIZE);
+            uint8_t *buffer = (uint8_t *) calloc(SSR_BUFF_SIZE, sizeof(*buffer));
             struct method_select_response *response =
-                    build_socks5_method_select_response(SOCKS5_METHOD_NOAUTH, (char *)buffer->buffer, buffer->capacity);
+                    build_socks5_method_select_response(SOCKS5_METHOD_NOAUTH, (char *)buffer, SSR_BUFF_SIZE);
 
             local_send_data(local, (char *)response, sizeof(*response));
 
-            buffer_release(buffer);
+            free(buffer);
 
             local->stage = STAGE_HANDSHAKE;
 
-            off = (request->nmethods & 0xff) + sizeof(*request);
+            off = (request->nmethods & 0xff) + (sizeof(*request) - 1);
             if ((request->ver == SOCKS5_VERSION) && (off < (int)(buf->len))) {
                 memmove(buf->buffer, buf->buffer + off, buf->len - off);
                 buf->len -= off;
@@ -520,7 +533,7 @@ local_recv_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf0)
                 addr_len = sizeof(sock_addr);
                 getsockname(uv_stream_fd(&local->socket), (struct sockaddr *)&sock_addr, &addr_len);
                 if (verbose) {
-                    LOGI("udp assc request accepted");
+                    LOGI("%s", "udp assc request accepted");
                 }
             } else if (request->cmd != SOCKS5_COMMAND_CONNECT) {
                 struct buffer_t *buffer = buffer_create(SSR_BUFF_SIZE);
@@ -541,15 +554,15 @@ local_recv_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf0)
 
             // Fake reply
             if (local->stage == STAGE_HANDSHAKE) {
-                struct buffer_t *buffer = buffer_create(SSR_BUFF_SIZE);
+                uint8_t *buffer = (uint8_t *) calloc(SSR_BUFF_SIZE, sizeof(*buffer));
                 size_t size = 0;
                 struct socks5_response *response =
                         build_socks5_response(SOCKS5_REPLY_SUCCESS, SOCKS5_ADDRTYPE__IPV4,
-                                              &sock_addr, buffer->buffer, buffer->capacity, &size);
+                                              &sock_addr, buffer,SSR_BUFF_SIZE, &size);
 
                 local_send_data(local, (char *)response, (unsigned int)size);
 
-                buffer_release(buffer);
+                free(buffer);
 
                 if (udp_assc) {
                     // Wait until client closes the connection
@@ -648,7 +661,7 @@ local_recv_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf0)
 
                     safe_free(hostname);
                 } else {
-                    strncpy(host, ip, sizeof(ip));
+                    strncpy(host, ip, sizeof(host)-1);
                 }
             }
 
@@ -787,7 +800,7 @@ local_recv_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf0)
 
             if (remote == NULL) {
                 buffer_release(abuf);
-                LOGE("invalid remote addr");
+                LOGE("%s", "invalid remote addr");
                 tunnel_close_and_free(remote, local);
                 return;
             }
@@ -881,7 +894,7 @@ local_send_cb(uv_write_t* req, int status)
         LOGE("local_send_cb: %s", uv_strerror(status));
         tunnel_close_and_free(remote, local);
     } else if (status == 0) {
-        local->buf->len = 0;
+        buffer_reset(local->buf);
     }
 }
 
@@ -941,7 +954,7 @@ remote_timeout_cb(uv_timer_t *handle)
     }
 
     if (verbose) {
-        LOGI("TCP connection timeout");
+        LOGI("%s", "TCP connection timeout");
     }
 
     tunnel_close_and_free(remote, local);
@@ -1399,6 +1412,7 @@ main(int argc, char **argv)
             { 0,           0,                 0, 0 },
     };
 
+    (void)use_new_listener; (void)hostnames; (void)iface;
     MEM_CHECK_BEGIN();
     MEM_CHECK_BREAK_ALLOC(63);
     MEM_CHECK_BREAK_ALLOC(64);
@@ -1422,14 +1436,14 @@ main(int argc, char **argv)
                 if (option_index == 0) {
                     fast_open = 1;
                 } else if (option_index == 1) {
-                    LOGI("initializing acl...");
+                    LOGI("%s", "initializing acl...");
                     acl = !init_acl(optarg);
                 } else if (option_index == 2) {
                     mtu = atoi(optarg);
                     LOGI("set MTU to %d", mtu);
                 } else if (option_index == 3) {
                     mptcp = 1;
-                    LOGI("enable multipath TCP");
+                    LOGI("%s", "enable multipath TCP");
                 } else if (option_index == 4) {
                     usage(VERSION, USING_CRYPTO);
                     exit(EXIT_SUCCESS);
@@ -1509,7 +1523,7 @@ main(int argc, char **argv)
                 usage(VERSION, USING_CRYPTO);
                 exit(EXIT_SUCCESS);
             case 'A':
-                LOGI("The 'A' argument is deprecate! Ignored.");
+                LOGI("%s", "The 'A' argument is deprecate! Ignored.");
                 break;
             case '6':
                 ipv6first = 1;
@@ -1550,42 +1564,42 @@ main(int argc, char **argv)
             use_new_listener = 1;
         } else {
             if (remote_num == 0) {
-                remote_num = conf->server_legacy.remote_num;
+                remote_num = conf->server_type.server_legacy.remote_num;
                 for (i = 0; i < remote_num; i++) {
-                    remote_addr[i] = conf->server_legacy.remote_addr[i];
+                    remote_addr[i] = conf->server_type.server_legacy.remote_addr[i];
                 }
             }
             if (remote_port == NULL) {
-                remote_port = conf->server_legacy.remote_port;
+                remote_port = conf->server_type.server_legacy.remote_port;
             }
             if (local_addr == NULL) {
-                local_addr = conf->server_legacy.local_addr;
+                local_addr = conf->server_type.server_legacy.local_addr;
             }
             if (local_port == NULL) {
-                local_port = conf->server_legacy.local_port;
+                local_port = conf->server_type.server_legacy.local_port;
             }
             if (password == NULL) {
-                password = conf->server_legacy.password;
+                password = conf->server_type.server_legacy.password;
             }
             // SSR beg
             if (protocol == NULL) {
-                protocol = conf->server_legacy.protocol;
+                protocol = conf->server_type.server_legacy.protocol;
                 LOGI("protocol %s", protocol);
             }
             if (protocol_param == NULL) {
-                protocol_param = conf->server_legacy.protocol_param;
+                protocol_param = conf->server_type.server_legacy.protocol_param;
                 LOGI("protocol_param %s", protocol_param);
             }
             if (method == NULL) {
-                method = conf->server_legacy.method;
+                method = conf->server_type.server_legacy.method;
                 LOGI("method %s", method);
             }
             if (obfs == NULL) {
-                obfs = conf->server_legacy.obfs;
+                obfs = conf->server_type.server_legacy.obfs;
                 LOGI("obfs %s", obfs);
             }
             if (obfs_param == NULL) {
-                obfs_param = conf->server_legacy.obfs_param;
+                obfs_param = conf->server_type.server_legacy.obfs_param;
                 LOGI("obfs_param %s", obfs_param);
             }
             // SSR end
@@ -1619,7 +1633,7 @@ main(int argc, char **argv)
 #endif
     }
     if (protocol && strcmp(protocol, "verify_sha1") == 0) {
-        LOGI("The verify_sha1 protocol is deprecate! Fallback to origin protocol.");
+        LOGI("%s", "The verify_sha1 protocol is deprecate! Fallback to origin protocol.");
         protocol = NULL;
     }
 
@@ -1665,7 +1679,7 @@ main(int argc, char **argv)
 
     if (fast_open == 1) {
 #ifdef TCP_FASTOPEN
-        LOGI("using tcp fast open");
+        LOGI("%s", "using tcp fast open");
 #else
         LOGE("tcp fast open is not supported by this environment");
         fast_open = 0;
@@ -1673,7 +1687,7 @@ main(int argc, char **argv)
     }
 
     if (ipv6first) {
-        LOGI("resolving hostname to IPv6 address first");
+        LOGI("%s", "resolving hostname to IPv6 address first");
     }
     srand((unsigned int)time(NULL));
 
@@ -1875,7 +1889,7 @@ int ssr_local_main_loop(const struct server_config *config, void(*feedback_state
     udp_server = NULL;
     // Setup UDP
     if (config->udp) {
-        LOGI("udprelay enabled");
+        LOGI("%s", "udprelay enabled");
         udp_server = udprelay_begin(loop, config->listen_host, port, (union sockaddr_universal *)listen_ctx->servers[0].addr_udp,
                       &tunnel_addr, 0, listen_ctx->timeout, listen_ctx->servers[0].cipher, listen_ctx->servers[0].protocol_name, listen_ctx->servers[0].protocol_param);
     }
@@ -1899,7 +1913,7 @@ int ssr_local_main_loop(const struct server_config *config, void(*feedback_state
 
 #ifndef __MINGW32__
     if (geteuid() == 0){
-        LOGI("running from root user");
+        LOGI("%s", "running from root user");
     }
 #endif
 
@@ -1914,7 +1928,7 @@ int ssr_local_main_loop(const struct server_config *config, void(*feedback_state
     uv_run(listener_socket->loop, UV_RUN_DEFAULT);
 
     if (verbose) {
-        LOGI("closed gracefully");
+        LOGI("%s", "closed gracefully");
     }
 
     // Clean up

@@ -55,7 +55,7 @@ socket_fd uv_stream_fd(const uv_tcp_t *handle) {
 }
 
 uint16_t get_socket_port(const uv_tcp_t *tcp) {
-    union sockaddr_universal tmp = { 0 };
+    union sockaddr_universal tmp = { {0} };
     int len = sizeof(tmp);
     if (uv_tcp_getsockname(tcp, &tmp.addr, &len) != 0) {
         return 0;
@@ -82,11 +82,7 @@ size_t get_fd_tcp_mss(socket_fd fd) {
     int mss = 0;
     socklen_t len = sizeof(mss);
 
-#if defined(WIN32) || defined(_WIN32)
     getsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, (char *)&mss, &len);
-#else
-    getsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &mss, &len);
-#endif
     if (50 < mss && mss <= NETWORK_MTU) {
         _tcp_mss = (size_t) mss;
     }
@@ -100,6 +96,7 @@ size_t socket_arrived_data_size(struct socket_ctx *socket, size_t suggested_size
     char *tmp = (char *)calloc(suggested_size + 1, sizeof(*tmp));
     data_size = (size_t) recv(fd, tmp, (int)suggested_size, MSG_PEEK);
     if (data_size == 0) { data_size = suggested_size; }
+    if (data_size >= 65536) { data_size = 65536/2; }
     free(tmp);
 
     return data_size;
@@ -507,6 +504,7 @@ void socket_write(struct socket_ctx *c, const void *data, size_t len) {
     char *write_buf = NULL;
     uv_write_t *req;
 
+    (void)tunnel;
     ASSERT(c->wrstate == socket_state_stop);
     c->wrstate = socket_state_busy;
 
@@ -566,6 +564,7 @@ static void socket_close(struct socket_ctx *c) {
     c->handle.handle.data = c;
 
     uv_read_stop(&c->handle.stream);
+    socket_timer_stop(c);
 
     tunnel_add_ref(tunnel);
     uv_close(&c->handle.handle, socket_close_done_cb);
@@ -592,7 +591,7 @@ void socket_dump_error_info(const char *title, struct socket_ctx *socket) {
         socks5_address_to_string(tunnel->desired_addr, addr, sizeof(addr));
         from = "_server_";
     } else {
-        union sockaddr_universal tmp = { 0 };
+        union sockaddr_universal tmp = { {0} };
         int len = sizeof(tmp);
         uv_tcp_getpeername(&socket->handle.tcp, &tmp.addr, &len);
         universal_address_to_string(&tmp, addr, sizeof(addr));
